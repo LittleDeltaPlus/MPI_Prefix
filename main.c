@@ -5,57 +5,79 @@
 #include <mpi.h>
 #include <math.h>
 
+/**
+ * Data About The Scan Array And MPI
+ */
 struct metadata{
-    int length;
-    int N;
-    int levels;
-    int runningTotal;
-    int loops;
+    int N; ///The Chosen Array Length
+    int length; ///The Length of the array with padding
+    int levels; ///The Number of Steps Need to complete the Up Phase
+    int loops;  ///The Number of Loops required to sum all values
+    int size;   ///The Number of Active Threads
+    int root;   ///The Root Thread
 };
 
-void lin_Scan(const int* input_array, int* output_array,const int sz){
-    output_array[0] = input_array[0];
-    for (int i = 1; i < sz; ++i) {
-        output_array[i]=output_array[i-1]+input_array[i];
-    }
-}
+/**
+ * Local Data For Each Thread
+ */
+struct thread {
+    int rank; ///Thread's MPI Rank
+    int runningTotal; ///Running Total Used by thread 0
+    int element; ///Output Value for each thread
+    int buffer; ///Space for a received element
+};
+/**
+ * A linear implementation of the prefix scan
+ * @param [in] input_array Values to be summed
+ * @param [out] output_array The summed values
+ * @param [in] sz How many values are present
+ */
+void LinScan(const int* input_array, int* output_array, int sz);
+/**
+ * Generates an array of sequential numbers starting at 1, Used to Generate Predictable Test Data
+ * @param [out] output_array The List of sequential Numbers
+ * @param [in] size The Size of the output array
+ * @param [in] upBound The size + any padding needed
+ */
+void GenSequential(int* output_array, int size, int upBound);
+/**
+ * Generates a list of Random numbers
+ * @param [out] output_array The List of generated Random Numbers
+ * @param [in] size The Size of the output array
+ * @param [in] upBound The size + any padding needed
+ */
+void GenRand(int* output_array, int size, int upBound);
+/**
+ * Use MPI metadata to calculate the number of levels & padding needed
+ * @param [in,out] metaData
+ */
+void GetArraySize(struct metadata *metaData);
+/**
+ * An Alternative Implementation of Prefix Scan Sum
+ * @param [in] metaData Data about the size of the scanned array & MPI Size
+ * @param [in,out] threadData Local variables for each thread
+ * @param [out] output The scanned array
+ */
+void PrefixScan(struct metadata *metaData, struct thread *threadData, int *output);
+/**
+ * The Up Phase of the Prefix scan
+ * @param [in] metaData Data about the size of the scanned array & MPI Size
+ * @param [in,out] threadData Local variables for each thread, including that thread's momentary total
+ */
+void UpPhase(struct metadata *metaData, struct thread *threadData);
+/**
+ * The Down Phase of the Prefix scan
+ * @param [in] metaData Data about the size of the scanned array & MPI Size
+ * @param [in,out] threadData Local variables for each thread, including that thread's output
+ */
+void DownPhase(struct metadata *metaData, struct thread *threadData);
+/**
+ * Gets a sanitised array length from the user
+ * @return N, The Chosen Array Length
+ */
+int GetUI();
 
-void gen_sequential(int* input_array, const int size, const int upBound){
-    for (int i = 0; i < size; ++i) {
-        input_array[i]=i+1;
-    }
-    for (int i = size; i < upBound; ++i) {
-        input_array[i] = 0;
-    }
-}
 
-void gen_rand(int* input_array, const int size, const int upBound){
-    srand(time(NULL));
-    for (int i = 0; i < size; ++i) {
-        input_array[i] = rand();
-    }
-    for (int i = size; i < upBound; ++i) {
-        input_array[i] = 0;
-    }
-}
-
-int get_UI(){
-    char val[10], *eptr; //Input string for scanf
-    int N; //The size of the array to be evaluated
-
-    printf("Enter Array Length:");
-    fflush(stdout);
-    scanf("%s", &val); //Get input from user
-    N = strtol(val, &eptr, 10); //Sanitize input
-//    N = 16;
-
-    // Error out if array is too small
-    if(N == 0){
-        printf("\nplease choose a number larger than 0\n");
-        fflush(stdout);
-        return 0;
-    }
-}
 
 int main(int argc, char **argv)
 {
@@ -63,163 +85,212 @@ int main(int argc, char **argv)
 
     //Init Local Variables
     struct metadata meta; //MetaData Struct
-    int rankElement, rankOutput, buf; //Local variables for scan
+    struct thread threadData; //local variables
     int *comp_domain, *output; //input and output Arrays
-    const int root = 0; //make root 0
+    meta.root = 0;//Set root 0
+    threadData.runningTotal = 0;//Start counting from 0
 
     //Get MPI info
-    int rank, size;
+    int size, rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-    int id = rank+1;
+    threadData.rank = rank;
 
-    int user_tag = rank;
 
-    if(rank==root){
-        //Get Valid User Input
-        meta.N = 0;
-        while (meta.N == 0){
-            meta.N = get_UI();
-        }
-
-        //pad array to nearest 2^x
-        meta.levels = ceil(log10(meta.N) / log10(2));
-        meta.length = ceil(pow(2, meta.levels));
-        meta.runningTotal = 0;
-        size = 16;
-        meta.loops = ceil((double)meta.length/(double)size);
-
-        if(meta.loops > 1){
-            meta.levels = ceil(log10(size* meta.loops)/log10(2));
-            meta.length = ceil(pow(2, meta.levels));
-        }
-
+    if(threadData.rank==meta.root){
+        meta.size = size;
+        //Calculate the size of the computation
+        GetArraySize(&meta);
 
         // Allocate Input and Output array sizes
         comp_domain = malloc(meta.length * sizeof(int));
         output = malloc(meta.length * sizeof(int));
 
         //Generate Input array
-        gen_sequential(comp_domain, meta.N, meta.length);
+        GenRand(comp_domain, meta.N, meta.length);
         //Populate Output with input
         memcpy(output, comp_domain, meta.length * sizeof(int));
-        //If only one thread, evaluate linearly
-        if (size == 1){
-            lin_Scan(comp_domain, output, meta.N);
-            for (int i = 0; i < meta.length; ++i) {
-                printf("%d, %d\n", comp_domain[i], output[i]);
-                fflush(stdout);
-            }
-            MPI_Finalize();
-            return 0;
-        }
     }
 
+    //If only one thread, evaluate linearly
+    if (meta.size == 1 && threadData.rank == meta.root){
 
-
-    //giveData
-    int *loopOutput;
-    loopOutput = calloc(size, sizeof(int));
-
-    MPI_Bcast(&meta, 5, MPI_INT, 0, MPI_COMM_WORLD);
-    for (int i = 0; i < meta.loops; ++i) {
-
-        if(rank == root){
-            memcpy(loopOutput, output +i*size, size * sizeof(int));
-            loopOutput[0] += meta.runningTotal;
-        }
-
-        MPI_Scatter(loopOutput, 1, MPI_INT, &rankElement, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-        rankOutput = rankElement;
-
-        //upPhase
-        for (int j = 1; j <= meta.levels; j++) {
-            rankElement = rankOutput;
-            // Find the 'step' for this iteration, and the corresponding data
-            int iterator = ceil(pow(2, j));
-            int diff = ceil(pow(2, j - 1));
-
-            //Get work Based off rank
-            if (id % iterator == 0 && rank - diff >= 0) {
-                //recv
-                MPI_Recv(&buf, 1, MPI_INT, rank - diff, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                rankOutput = rankElement + buf;
-            } else if (id % iterator == diff && rank + diff < size) {
-                //send
-                MPI_Send(&rankElement, 1, MPI_INT, rank + diff, 0, MPI_COMM_WORLD);
-            } else {
-                //wait
-            }
-            //Ensure all finished
-            MPI_Barrier(MPI_COMM_WORLD);
-        }
-
-        //downPhase
-        for (int j = meta.levels - 1; j >= 1; j--) {
-            rankElement = rankOutput;
-            // Find the 'step' for this iteration, and the corresponding data
-            int iterator = ceil(pow(2, j));
-            int diff = ceil(pow(2, j - 1));
-
-            //Get work Based off rank
-            if (id % iterator == 0 && rank + diff < size) {
-                //recv
-                MPI_Send(&rankElement, 1, MPI_INT, rank + diff, 0, MPI_COMM_WORLD);
-            } else if (id % iterator == diff && rank - diff >= 0 && id > diff) {
-                //send
-                MPI_Recv(&buf, 1, MPI_INT, rank - diff, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                rankOutput = rankElement + buf;
-
-            } else {
-                //wait
-            }
-            //ensure all finished
-            MPI_Barrier(MPI_COMM_WORLD);
-        }
-
-        //Collect all rankOutputs into loopOutput
-        MPI_Gather(&rankOutput, 1, MPI_INT, loopOutput, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-        if(rank == root){
-            memcpy(output + i*size, loopOutput, size * sizeof(int));
-            meta.runningTotal = loopOutput[size-1];
-        }
-    }
-
-    if(rank == root){
-        //generate linear eq. for testing
-        int *linear_output = malloc(meta.length * sizeof(int));
-        lin_Scan(comp_domain, linear_output, meta.length);
-
-        //List input vs. MPI vs. Linear
-        for (int i = 0; i < meta.N; ++i) {
-            printf("%d, %d, %d\n", comp_domain[i], output[i] ,linear_output[i]);
+        //perform a single threaded prefix scan
+        LinScan(comp_domain, output, meta.N);
+        //print output to screen
+        for (int i = 0; i < meta.length; ++i) {
+            printf("%d, %d\n", comp_domain[i], output[i]);
             fflush(stdout);
         }
-    }
+    } else {
+        //Perform Multi-threaded Prefix scan
+        PrefixScan(&meta, &threadData, output);
 
+        //Output to screen
+        if(threadData.rank == meta.root){
+
+            //generate linear eq. for testing
+            int *linear_output = malloc(meta.length * sizeof(int));
+            LinScan(comp_domain, linear_output, meta.length);
+
+            //List input vs. MPI vs. Linear
+            for (int i = 0; i < meta.N; ++i) {
+                printf("%d, %d, %d\n", comp_domain[i], output[i] ,linear_output[i]);
+                fflush(stdout);
+            }
+        }
+    }
     //Exit
     MPI_Finalize();
     return 0;
 }
 
+void LinScan(const int* input_array, int* output_array, const int sz){
+    //start the count at the first value
+    output_array[0] = input_array[0];
+    for (int i = 1; i < sz; ++i) {
+        //add the previous output value to the following input value
+        output_array[i]=output_array[i-1]+input_array[i];
+    }
+}
 
+void GenSequential(int* output_array, const int size, const int upBound){
+    for (int i = 0; i < size; ++i) {
+        //Set each number to a sequential value, starting at one
+        output_array[i]= i + 1;
+    }
+    for (int i = size; i < upBound; ++i) {
+        //pad if necessary
+        output_array[i] = 0;
+    }
+}
 
-/**
- * 1. get size
- * 2. threads = size
- * 3. get upper bounds next 2^x
- * 4. gen data
- * 5. broadcast meta-data
- * 6. send each thread it's own data
- * 7. (par) foreach level in algotitm -> {
- *          am I receiving?
- *              yes - getData
- *              no - sendData or Wait
- *          on receive -> {
- *              perform update
- *          }
- * }
- *
- */
+void GenRand(int* output_array, const int size, const int upBound){
+    //seed random number generator
+    //TODO: Find Cryptographic compliant variant
+    srand(time(NULL));
+    for (int i = 0; i < size; ++i) {
+        //set each 'useful' element to a random number
+        output_array[i] = rand();
+    }
+    for (int i = size; i < upBound; ++i) {
+        //pad if necessary
+        output_array[i] = 0;
+    }
+}
+
+int GetUI(){
+    char val[10], *eptr; //Input string for scanf
+    int N; //The size of the array to be evaluated
+
+    printf("Enter Array Length:");
+    fflush(stdout);
+    scanf("%s", &val); //Get input from user
+    N = strtol(val, &eptr, 10); //Sanitize input
+
+    // Error out if array is too small
+    if(N == 0){
+        printf("\nplease choose a number larger than 0\n");
+        fflush(stdout);
+        return 0;
+    }
+    return N;
+}
+
+void GetArraySize(struct metadata *metaData){
+    //Get Valid User Input
+    metaData->N = 0;
+    while (metaData->N == 0){
+        metaData->N = GetUI();
+    }
+
+    //pad array to nearest 2^x
+    metaData->levels = ceil(log10(metaData->N) / log10(2));
+    metaData->length = ceil(pow(2, metaData->levels));
+    metaData->loops = ceil((double)metaData->length/(double)metaData->size);
+
+    //If fit N to a multiple of size
+    if(metaData->loops > 1){
+        metaData->levels = ceil(log10(metaData->size* metaData->loops)/log10(2));
+        metaData->length = ceil(pow(2, metaData->levels));
+    }
+}
+
+void PrefixScan(struct metadata *metaData, struct thread *threadData, int *output) {
+    //giveData
+    MPI_Bcast(metaData, 6, MPI_INT, 0, MPI_COMM_WORLD);
+    int *loopOutput;
+    for (int i = 0; i < metaData->loops; ++i) {
+
+        if (threadData->rank == metaData->root) {
+            loopOutput = malloc(metaData->size * sizeof(int));
+            memcpy(loopOutput, output + i * metaData->size, metaData->size * sizeof(int));
+            loopOutput[0] += threadData->runningTotal;
+        }
+
+        //Scatter data for this loop
+        MPI_Scatter(loopOutput, 1, MPI_INT, &threadData->element, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+        //Up Phase
+        UpPhase(metaData, threadData);
+        //Dow Phase
+        DownPhase(metaData, threadData);
+
+        //Collect all rankOutputs into loopOutput
+        MPI_Gather(&threadData->element, 1, MPI_INT, loopOutput, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+        //Copy evaluation to output, update running total
+        if (threadData->rank == metaData->root) {
+            memcpy(output + i * metaData->size, loopOutput, metaData->size * sizeof(int));
+            threadData->runningTotal = loopOutput[metaData->size - 1];
+        }
+    }
+}
+
+void UpPhase(struct metadata *metaData, struct thread *threadData){
+    int id = threadData->rank+1;
+    for (int j = 1; j <= metaData->levels; j++) {
+        // Find the 'step' for this iteration, and the corresponding data
+        int iterator = ceil(pow(2, j));
+        int diff = ceil(pow(2, j - 1));
+
+        //Get work Based off rank
+        if (id % iterator == 0 && threadData->rank - diff >= 0) {
+            //recv
+            MPI_Recv(&threadData->buffer, 1, MPI_INT, threadData->rank - diff, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            threadData->element += threadData->buffer;
+        } else if (id % iterator == diff && threadData->rank + diff < metaData->size) {
+            //send
+            MPI_Send(&threadData->element, 1, MPI_INT, threadData->rank + diff, 0, MPI_COMM_WORLD);
+        } else {
+            //wait
+        }
+        //Ensure all finished
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+};
+
+void DownPhase(struct metadata *metaData, struct thread *threadData){
+    int id = threadData->rank+1;
+    for (int j = metaData->levels - 1; j >= 1; j--) {
+        // Find the 'step' for this iteration, and the corresponding data
+        int iterator = ceil(pow(2, j));
+        int diff = ceil(pow(2, j - 1));
+
+        //Get work Based off rank
+        if (id % iterator == 0 && threadData->rank + diff < metaData->size) {
+            //recv
+            MPI_Send(&threadData->element, 1, MPI_INT, threadData->rank + diff, 0, MPI_COMM_WORLD);
+        } else if (id % iterator == diff && threadData->rank - diff >= 0 && id > diff) {
+            //send
+            MPI_Recv(&threadData->buffer, 1, MPI_INT, threadData->rank - diff, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            threadData->element += threadData->buffer;
+
+        } else {
+            //wait
+        }
+        //ensure all finished
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+};
+
