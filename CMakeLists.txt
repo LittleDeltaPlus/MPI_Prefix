@@ -3,7 +3,6 @@ project(prefix_scan C)
 
 set(CMAKE_C_STANDARD 11)
 find_package(MPI REQUIRED)
-
 include_directories(${MPI_INCLUDE_PATH})
 
 add_executable(prefix_scan main.c)
